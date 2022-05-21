@@ -661,3 +661,4 @@ typedef enum {
  * 
  */
 
+#define atomic_store(a, b) __atomic_store_n(a, b, __ATOMIC_RELAXED)

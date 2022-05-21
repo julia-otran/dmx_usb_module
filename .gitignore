@@ -9,4 +9,5 @@ dmx_usb.mod.o
 dmx_usb.o
 dmx_usb_test
 modules.order
-
+x509.genkey
+x509.keyfile

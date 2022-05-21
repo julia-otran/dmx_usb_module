@@ -24,16 +24,20 @@
 #include <linux/version.h>
 #include <linux/semaphore.h>
 #include <linux/uaccess.h>
-
+#include <linux/time64.h>
+#include <linux/kthread.h>
+#include <linux/sched.h>
 
 #define init_MUTEX(LOCKNAME) sema_init(LOCKNAME,1);
 
 #include "dmx_usb.h"
 
+#define CONFIG_USB_DEBUG 1
+
 #ifdef CONFIG_USB_DEBUG
 	static int debug = 1;
 #else
-	static int debug;
+	static int debug = 0;
 #endif
 
 /* Use our own dbg macro */
@@ -89,17 +93,35 @@ struct dmx_usb_device {
 	__u8			bulk_out_endpointAddr;	/* the address of the bulk out endpoint */
 	atomic_t		write_busy;		/* true iff write urb is busy */
 	struct completion	write_finished;		/* wait for the write to finish */
+	__u8 write_busy_instant;
 
 	int			open;			/* if the port is open or not */
 	int			present;		/* if the device is not disconnected */
 	struct semaphore	sem;			/* locks this structure */
+	struct task_struct *ktask;
+	atomic64_t write_buffer;
+	atomic_t write_buffer_size;
+	struct completion async_write_completion;
+	struct semaphore	write_sem;
+	struct completion write_exit_completion;
 };
 
+
+static ktime_t test_cb_time;
+static int write_thread_run;
 
 /* prevent races between open() and disconnect() */
 	static DEFINE_SEMAPHORE(disconnect_sem);
 
+// 30 FPS (writes seems to take a max of 32ms)
+#define DMX_NS_PER_FRAME_NORMAL (33 * 1000 * 1000)
+#define DMX_NS_PER_FRAME_FAST (21 * 1000 * 1000)
+
 /* local function prototypes */
+static int dmx_set_scheduler(struct task_struct *ts);
+static int dmx_sleep(unsigned long ns);
+static int dmx_write_thread(void *data);
+static ssize_t dmx_usb_write_internal(struct dmx_usb_device *dev, const char *buffer, size_t count, ktime_t *ftdi_time);
 static ssize_t dmx_usb_write	(struct file *file, const char *buffer, size_t count, loff_t *ppos);
 static long dmx_usb_ioctl	(struct file *file, unsigned int cmd, unsigned long arg);
 static int dmx_usb_open		(struct inode *inode, struct file *file);
@@ -145,6 +167,55 @@ static struct usb_driver dmx_usb_driver = {
 	.disconnect =	dmx_usb_disconnect,
 	.id_table =	dmx_usb_table,
 };
+
+static int dmx_set_scheduler(struct task_struct *ts)
+{
+	int result = 0;
+
+	sched_set_fifo(ts);
+
+	if (result) {
+		err("[DMX USB] Setting scheduler failed. Timing will not be constant");
+	}
+
+	return result;
+}
+
+static int dmx_sleep(unsigned long ns)
+{
+	unsigned long us = ns / 1000;
+	unsigned long ms = us / 1000;
+
+	ktime_t delta;
+	ktime_t time = ktime_get();
+
+	if (ns <= 10000) {
+		do {
+			// Best way found, get stuck at a loop
+			delta = ktime_get() - time;
+		} while (delta < ns);
+	} else if (ms > 10) {
+		msleep(ms);
+	} else if (us > 5000) {
+		usleep_range(us - 2500, us);
+	} else if (us > 2000) {
+		usleep_range(us - 1000, us);
+	} else if (us > 1000) {
+		usleep_range(us - 500, us);
+	} else {
+		usleep_range(0, us);
+	}
+
+	time = ktime_get() - time;
+
+	/*
+	if (time > ns + 1000000) {
+		dbg("[DMX USB] Sleep took too long. should be %lu but was %lu", ns, time);
+	}
+	*/
+
+	return 0;
+}
 
 /**
  */
@@ -244,13 +315,26 @@ static void dmx_usb_set_break(struct dmx_usb_device* dev, int break_state)
 		err("%s FAILED to enable/disable break state (state was %d) errno: %d", __FUNCTION__, break_state, ctrl_result);
 	}
 
-	dbg("%s break state is %d - urb is %d", __FUNCTION__,break_state, urb_value);
+	// dbg("%s break state is %d - urb is %d", __FUNCTION__,break_state, urb_value);
 }
 
 /**
  */
 static inline void dmx_usb_delete (struct dmx_usb_device *dev)
 {
+	char *tmp_frame = NULL;
+
+	if (dev->ktask) {
+		dev->present = 0;
+		wait_for_completion(&dev->write_exit_completion);
+	}
+
+	tmp_frame = atomic64_read(&dev->write_buffer);
+
+	if (tmp_frame) {
+		kfree(tmp_frame);
+	}
+
 	kfree (dev->bulk_in_buffer);
 	usb_free_coherent (dev->udev, dev->bulk_out_alloc_size,
 				dev->bulk_out_buffer,
@@ -258,7 +342,6 @@ static inline void dmx_usb_delete (struct dmx_usb_device *dev)
 	usb_free_urb (dev->write_urb);
 	kfree (dev);
 }
-
 
 /**
  */
@@ -324,7 +407,8 @@ static int dmx_usb_release (struct inode *inode, struct file *file)
 	dbg("%s - minor %d", __FUNCTION__, dev->minor);
 
 	/* lock our device */
-	down (&dev->sem);
+	down(&dev->write_sem);
+	down(&dev->sem);
 
 	if (dev->open <= 0) {
 		dbg ("%s - device not opened", __FUNCTION__);
@@ -340,13 +424,15 @@ static int dmx_usb_release (struct inode *inode, struct file *file)
 
 	if (!dev->present && !dev->open) {
 		/* the device was unplugged before the file was released */
-		up (&dev->sem);
+		up(&dev->sem);
+		up(&dev->write_sem);
 		dmx_usb_delete (dev);
 		return 0;
 	}
 
 exit_not_opened:
 	up (&dev->sem);
+	up(&dev->write_sem);
 
 	return retval;
 }
@@ -380,7 +466,229 @@ error:
 	return status;
 }
 
+static int dmx_write_thread(void *data)
+{
+	struct dmx_usb_device *dev;
+	char *last_frame;
+	char *tmp_frame;
+	size_t last_frame_size;
+	int lost_frames = 0;
+	int dev_present = 1;
 
+	// FPS Control
+	ktime_t last_time;
+	ktime_t prev_time;
+	ktime_t delta_time;
+	ktime_t next_sleep;
+	ktime_t aux_time;
+	ktime_t expected_time;
+	ktime_t ftdi_time;
+
+	dev = (struct dmx_usb_device*)data;
+
+	down (&dev->sem);
+	dmx_set_scheduler(dev->ktask);
+	up(&dev->sem);
+
+	last_frame = NULL;
+	last_time = ktime_get();
+	last_frame_size = 0;
+
+	while(dev_present && write_thread_run) {
+		/* lock this object */
+		down (&dev->sem);
+
+		tmp_frame = atomic64_read(&dev->write_buffer);
+
+		dev_present = dev->present;
+
+		if (!dev_present) {
+			up(&dev->sem);
+			continue;
+		}
+
+		if (tmp_frame) {
+			if (last_frame) {
+				kfree(last_frame);
+				last_frame = NULL;
+			}
+
+			lost_frames = 0;
+			last_frame = tmp_frame;
+			last_frame_size = atomic_read(&dev->write_buffer_size);
+
+			atomic_set(&dev->write_buffer_size, 0);
+			atomic64_set(&dev->write_buffer, NULL);
+			complete(&dev->async_write_completion);
+		} else if (last_frame) {
+			lost_frames++;
+
+			if (lost_frames > 100) {
+				lost_frames = 0;
+				kfree(last_frame);
+				last_frame = NULL;
+			}
+		}
+
+		if (last_frame) {
+			aux_time = ktime_get();
+			dmx_usb_write_internal(dev, last_frame, last_frame_size, &ftdi_time);
+			aux_time = ktime_get() - aux_time;
+
+			if (aux_time > 20000000) {
+				// dbg("[DMX USB] Write took %lu", aux_time / 1000000);
+			}
+		} else {
+			ftdi_time = 0;
+			up (&dev->sem);
+			// No need intelligent sleeps
+			dmx_sleep(DMX_NS_PER_FRAME_NORMAL);
+			continue;
+		}
+
+		/* unlock the device */
+		up (&dev->sem);
+
+		// Prevent buffer underflow
+		/*
+		if (ftdi_time >= 8000000) {
+			expected_time = DMX_NS_PER_FRAME_NORMAL;
+		} else {
+			expected_time = DMX_NS_PER_FRAME_FAST;
+		}
+		*/
+
+		expected_time = DMX_NS_PER_FRAME_FAST + ftdi_time;
+
+		prev_time = last_time;
+		last_time = ktime_get();
+		aux_time = last_time;
+		delta_time = last_time - prev_time;
+
+		if (delta_time >= expected_time) {
+			dbg("[DMX USB] Frame too late, skipping sleeps. took %lu ms", delta_time / 1000000);
+		} else {
+			while (delta_time < expected_time) {
+				next_sleep = (expected_time - delta_time) / 1000;
+
+				if (next_sleep <= 10000) {
+					next_sleep = expected_time - delta_time;
+				}
+
+				dmx_sleep(next_sleep);
+
+				last_time = ktime_get();
+				delta_time = last_time - prev_time;
+			}
+
+			if (delta_time > (expected_time + 1500000)) {
+				dbg("[DMX USB] All sleeps took long");
+			}
+		}
+	}
+
+	if (last_frame) {
+		kfree(last_frame);
+		last_frame = NULL;
+	}
+
+	complete(&dev->write_exit_completion);
+
+	return 0;
+}
+
+static ssize_t dmx_usb_write_internal(struct dmx_usb_device *dev, const char *buffer, size_t count, ktime_t *ftdi_time)
+{
+	ktime_t aux_time;
+	ssize_t bytes_written = 0;
+	int retval = 0;
+	__u16 stat;
+
+	// dbg("%s - minor %d, count = %d", __FUNCTION__, dev->minor, count);
+
+	/* verify that the device wasn't unplugged */
+	if (!dev->present) {
+		retval = -ENODEV;
+		goto exit;
+	}
+
+	/* verify that we actually have some data to write */
+	if (count == 0) {
+		dbg("%s - write request of 0 bytes", __FUNCTION__);
+		goto exit;
+	}
+
+	atomic_set(&dev->write_busy, 1);
+	init_completion(&dev->write_finished);
+	dev->write_busy_instant = 1;
+
+	/* we can only write as much as our buffer will hold */
+	bytes_written = min (dev->bulk_out_size, count+1);
+
+	/* copy the data from userspace into our transfer buffer;
+	 * this is the only copy required.
+	 */
+	memset(dev->write_urb->transfer_buffer, 0, 1);
+	memcpy(&dev->write_urb->transfer_buffer[1], buffer, bytes_written);
+
+	// dmx_usb_debug_data (__FUNCTION__, bytes_written,
+	//		     dev->write_urb->transfer_buffer);
+
+	/* this urb was already set up, except for this write size */
+	dev->write_urb->transfer_buffer_length = bytes_written;
+
+	/* the transmit buffer is empty, now toggle the break */
+	dmx_usb_set_break(dev, 1);
+	dmx_usb_set_break(dev, 0);
+
+	aux_time = ktime_get();
+	test_cb_time = aux_time;
+
+	retval = usb_submit_urb(dev->write_urb, GFP_KERNEL);
+
+	aux_time = ktime_get() - aux_time;
+
+	// dbg("[DMX USB] URB submit time %lu ms", aux_time / 1000000);
+
+	aux_time = ktime_get();
+
+	if (retval) {
+		dev->write_busy_instant = 0;
+		atomic_set (&dev->write_busy, 0);
+		err("%s - failed submitting write urb, error %d",
+		    __FUNCTION__, retval);
+	} else {
+		while (dev->write_busy_instant) {
+			dmx_sleep(100000);
+		}
+		retval = bytes_written;
+	}
+
+	aux_time = ktime_get() - aux_time;
+
+	// dbg("[DMX USB] URB callback time %lu ms", aux_time / 1000000);
+
+	aux_time = ktime_get();
+
+	/* Poll the device to see if the transmit buffer is empty */
+	do {
+		dmx_sleep(100000);
+
+		stat = dmx_usb_get_status(dev);
+		if (stat == 0) {
+			retval = -EFAULT;
+			goto exit;
+		}
+	} while ( (stat & ((FTDI_RS_TEMT) << 8) ) == 0 ) ;
+
+	aux_time = ktime_get() - aux_time;
+	*ftdi_time = aux_time;
+
+	// dbg("[DMX USB] FTDI write %lu ms", aux_time / 1000000);
+
+exit:
+	return retval;
+}
 
 /**
  *	dmx_usb_write
@@ -403,82 +711,56 @@ static ssize_t dmx_usb_write (struct file *file, const char *buffer, size_t coun
 	ssize_t bytes_written = 0;
 	int retval = 0;
 	__u16 stat;
+	char *from_user;
+	uint64_t sleep_total = 0;
 
 	dev = (struct dmx_usb_device *)file->private_data;
 
-	dbg("%s - minor %d, count = %d", __FUNCTION__, dev->minor, count);
+	down(&dev->write_sem);
 
-	/* lock this object */
-	down (&dev->sem);
-
-	/* verify that the device wasn't unplugged */
 	if (!dev->present) {
-		retval = -ENODEV;
-		goto exit;
+		up(&dev->write_sem);
+		return -EFAULT;
 	}
 
-	/* verify that we actually have some data to write */
-	if (count == 0) {
-		dbg("%s - write request of 0 bytes", __FUNCTION__);
-		goto exit;
+	from_user  = (char*)kmalloc(count, GFP_KERNEL);
+
+	if (!from_user) {
+		return -ENOMEM;
 	}
 
-	/* wait for a previous write to finish up; we don't use a timeout
-	 * and so a nonresponsive device can delay us indefinitely.
-	 */
-	if (atomic_read (&dev->write_busy))
-		wait_for_completion (&dev->write_finished);
-
-	/* we can only write as much as our buffer will hold */
-	bytes_written = min (dev->bulk_out_size, count);
-
-	/* copy the data from userspace into our transfer buffer;
-	 * this is the only copy required.
-	 */
-	if (copy_from_user(dev->write_urb->transfer_buffer, buffer,
-			   bytes_written)) {
-		retval = -EFAULT;
-		goto exit;
-	}
-
-	dmx_usb_debug_data (__FUNCTION__, bytes_written,
-			     dev->write_urb->transfer_buffer);
-
-	/* this urb was already set up, except for this write size */
-	dev->write_urb->transfer_buffer_length = bytes_written;
-
-	/* Poll the device to see if the transmit buffer is empty */
-	do {
-		stat = dmx_usb_get_status(dev);
-		if (stat == 0) {
-			retval = -EFAULT;
-			goto exit;
-		}
-	} while ( (stat & ((FTDI_RS_TEMT) << 8) ) == 0 ) ;
-
-	/* the transmit buffer is empty, now toggle the break */
-	dmx_usb_set_break(dev, 1);
-	dmx_usb_set_break(dev, 0);
-
-	/* send the data out the bulk port */
-	/* a character device write uses GFP_KERNEL,
-	 unless a spinlock is held */
-	init_completion (&dev->write_finished);
-	atomic_set (&dev->write_busy, 1);
-	retval = usb_submit_urb(dev->write_urb, GFP_KERNEL);
-	if (retval) {
-		atomic_set (&dev->write_busy, 0);
-		err("%s - failed submitting write urb, error %d",
-		    __FUNCTION__, retval);
+	if (count > dev->bulk_out_size - 1) {
+		retval = dev->bulk_out_size - 1;
 	} else {
-		retval = bytes_written;
+		retval = count;
 	}
 
+	if (copy_from_user(from_user, buffer, retval)) {
+		return -EFAULT;
+	}
 
-exit:
-	/* unlock the device */
-	up (&dev->sem);
+	if (dev->ktask != NULL) {
+		if (atomic64_read(&dev->write_buffer) == NULL) {
+			init_completion(&dev->async_write_completion);
 
+			atomic_set(&dev->write_buffer_size, retval);
+			atomic64_set(&dev->write_buffer, from_user);
+
+			wait_for_completion_interruptible_timeout(&dev->async_write_completion, DMX_NS_PER_FRAME_NORMAL * 2);
+		} else {
+			kfree(from_user);
+			// err("[DMX USB] Frame dropped.");
+
+			// Wait some time, maybe the frame get's consumed
+			dmx_sleep(2000000);
+		}
+	} else {
+		kfree(from_user);
+		err("[DMx USB] Write thread is running? Dropping frame.");
+		retval = -EFAULT;
+	}
+
+	up(&dev->write_sem);
 	return retval;
 }
 
@@ -519,7 +801,7 @@ static void dmx_usb_write_bulk_callback (struct urb *urb)
 {
 	struct dmx_usb_device *dev = (struct dmx_usb_device *)urb->context;
 
-	dbg("%s - minor %d", __FUNCTION__, dev->minor);
+	// dbg("%s - minor %d", __FUNCTION__, dev->minor);
 
 	/* sync/async unlink faults aren't errors */
 	if (urb->status && !(urb->status == -ENOENT ||
@@ -528,7 +810,12 @@ static void dmx_usb_write_bulk_callback (struct urb *urb)
 		    __FUNCTION__, urb->status);
 	}
 
+	test_cb_time = ktime_get() - test_cb_time;
+
+	// dbg("[DMX USB] Callback took %lu", test_cb_time / 1000000);
+
 	/* notify anyone waiting that the write has finished */
+	dev->write_busy_instant = 0;
 	atomic_set (&dev->write_busy, 0);
 	complete (&dev->write_finished);
 }
@@ -562,7 +849,10 @@ static int dmx_usb_probe(struct usb_interface *interface, const struct usb_devic
 	}
 	memset (dev, 0x00, sizeof (*dev));
 
-	init_MUTEX (&dev->sem);
+	init_MUTEX(&dev->sem);
+	init_MUTEX(&dev->write_sem);
+	init_completion(&dev->write_exit_completion);
+
 	dev->udev = udev;
 	dev->interface = interface;
 
@@ -650,6 +940,16 @@ static int dmx_usb_probe(struct usb_interface *interface, const struct usb_devic
 
 	/* let the user know what node this device is now attached to */
 	info ("DMX USB device now attached to dmx%d", dev->minor);
+
+	atomic64_set(&dev->write_buffer, NULL);
+
+	dev->ktask = kthread_run(dmx_write_thread, dev, "[DMX USB Write Thread]");
+
+	if (IS_ERR(dev->ktask)) {
+		err("[DMX USB] Failed to start DMX USB Write Thread. Will write data sync");
+		dev->ktask = NULL;
+	}
+
 	return 0;
 
 error:
@@ -679,7 +979,8 @@ static void dmx_usb_disconnect(struct usb_interface *interface)
 	dev = usb_get_intfdata (interface);
 	usb_set_intfdata (interface, NULL);
 
-	down (&dev->sem);
+	down(&dev->write_sem);
+	down(&dev->sem);
 
 	minor = dev->minor;
 
@@ -695,7 +996,8 @@ static void dmx_usb_disconnect(struct usb_interface *interface)
 	/* prevent device read, write and ioctl */
 	dev->present = 0;
 
-	up (&dev->sem);
+	up(&dev->sem);
+	up(&dev->write_sem);
 
 	/* if the device is opened, dmx_usb_release will clean this up */
 	if (!dev->open)
@@ -715,6 +1017,8 @@ static int __init dmx_usb_init(void)
 {
 	int result;
 
+	write_thread_run = 1;
+
 	/* register this driver with the USB subsystem */
 	result = usb_register(&dmx_usb_driver);
 	if (result) {
@@ -733,6 +1037,8 @@ static int __init dmx_usb_init(void)
  */
 static void __exit dmx_usb_exit(void)
 {
+	write_thread_run = 0;
+
 	/* deregister this driver with the USB subsystem */
 	usb_deregister(&dmx_usb_driver);
 }

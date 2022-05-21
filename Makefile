@@ -12,8 +12,11 @@ KDIR	:= /lib/modules/$(shell uname -r)/build
 PWD	:= $(shell pwd)
 
 default:
-	$(MAKE) -C $(KDIR) M=$(PWD)
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
 	gcc -O2 -pipe -Wall dmx_usb_test.c -o dmx_usb_test
+
+install:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 
 endif
 
