@@ -16,6 +16,7 @@ default:
 	gcc -O2 -pipe -Wall dmx_usb_test.c -o dmx_usb_test
 
 install:
+	kmodsign sha512 /certs/kern/signing_key.pem /certs/kern/signing_key.x509 dmx_usb.ko
 	$(MAKE) -C $(KDIR) M=$(PWD) modules_install
 
 endif
