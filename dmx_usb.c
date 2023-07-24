@@ -491,13 +491,9 @@ static int dmx_write_thread(void *data)
 	last_frame_size = 0;
 
 	while(dev->present && dev->write_thread_run && all_write_thread_run) {
-		/* lock this object */
-		down (&dev->sem);
-
 		tmp_frame = (void*) atomic64_read(&dev->write_buffer);
 
 		if (!dev->present) {
-			up(&dev->sem);
 			continue;
 		}
 
@@ -538,14 +534,10 @@ static int dmx_write_thread(void *data)
 			dmx_usb_wait_temt(dev);
 			// dbg("[DMX USB] Write took %lu", aux_time / 1000000);
 		} else {
-			up (&dev->sem);
 			// No need intelligent sleeps
 			dmx_sleep(DMX_NS_PER_FRAME_NORMAL);
 			continue;
 		}
-
-		/* unlock the device */
-		up (&dev->sem);
 	}
 
 	if (last_frame) {
@@ -682,7 +674,11 @@ static ssize_t dmx_usb_write (struct file *file, const char *buffer, size_t coun
 
 	dev = (struct dmx_usb_device *)file->private_data;
 
-	down(&dev->write_sem);
+	retval = down_timeout(&dev->write_sem, 1*HZ);
+
+	if (retval) {
+		return -EFAULT;
+	}
 
 	if (!dev->present) {
 		up(&dev->write_sem);
@@ -908,14 +904,14 @@ static int dmx_usb_probe(struct usb_interface *interface, const struct usb_devic
 
 	atomic64_set(&dev->write_buffer, 0);
 
+	dev->write_thread_run = 1;
+
 	dev->ktask = kthread_run(dmx_write_thread, dev, "[DMX USB Write Thread]");
 
 	if (IS_ERR(dev->ktask)) {
 		err("[DMX USB] Failed to start DMX USB Write Thread. Will write data sync");
 		dev->ktask = NULL;
 	}
-
-	dev->write_thread_run = 1;
 
 	return 0;
 
@@ -948,6 +944,14 @@ static void dmx_usb_disconnect(struct usb_interface *interface)
 
 	dev->write_thread_run = 0;
 
+	/* terminate an ongoing write */
+	if (atomic_read (&dev->write_busy)) {
+		usb_unlink_urb (dev->write_urb);
+		wait_for_completion (&dev->write_finished);
+	}
+
+	wait_for_completion(&dev->write_exit_completion);
+
 	down(&dev->write_sem);
 	down(&dev->sem);
 
@@ -955,12 +959,6 @@ static void dmx_usb_disconnect(struct usb_interface *interface)
 
 	/* give back our minor */
 	usb_deregister_dev (interface, &dmx_usb_class);
-
-	/* terminate an ongoing write */
-	if (atomic_read (&dev->write_busy)) {
-		usb_unlink_urb (dev->write_urb);
-		wait_for_completion (&dev->write_finished);
-	}
 
 	/* prevent device read, write and ioctl */
 	dev->present = 0;
