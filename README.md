@@ -1,9 +1,28 @@
-# DMX USB Driver
+# Linux JSLC DMX USB Driver
 
-The DMX USB driver is a Linux 4.X kernel driver for the Enttec
+The DMX USB driver is a Linux 6.X kernel driver for the Enttec
 DMX USB dongle ( http://www.enttec.com/dmxusb.php )
 
+- It runs very smooth, 
+- It does not bugs under high I/O (the default driver under such case will send something that makes everything flash)
+- Can reach 41 DMX FPS. 
+
+## Beware!
+This driver expects at most 512 bytes of data.
+
+The original driver expected that the wrote data includes startCode at a total of 513 bytes.
+
+**Do not write the the DMX start code when using this driver fork**
+
+If you do want to use with it with DMX Samples, remember to remove the extra first byte of the examples.
+
 ## Building the driver
+
+*For x64 platforms, you may need sign the module*
+
+
+As far as I know, most people use secure boot. This prevents unsigned modules from running. However you can create your own certificate and install it on the bios. Also, there's many documentation about how to do this process, so take a look on the internet.
+
 
 Before the driver can be build, the kernel sourcecode needs to be 
 installed. To build the driver just call make, this should build a
