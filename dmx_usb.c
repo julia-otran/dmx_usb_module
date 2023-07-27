@@ -116,7 +116,7 @@ static __u8 all_write_thread_run;
 
 // 30 FPS (writes seems to take a max of 32ms)
 #define DMX_NS_PER_FRAME_NORMAL (33 * 1000 * 1000)
-#define DMX_NS_PER_FRAME_FAST (21 * 1000 * 1000)
+#define DMX_NS_PER_FRAME_MAX (40 * 1000 * 1000)
 
 /* local function prototypes */
 static int dmx_set_scheduler(struct task_struct *ts);
@@ -329,7 +329,7 @@ static inline void dmx_usb_delete (struct dmx_usb_device *dev)
 	if (dev->ktask) {
 		dev->present = 0;
 		dev->write_thread_run = 0;
-		wait_for_completion(&dev->write_exit_completion);
+		wait_for_completion_interruptible_timeout(&dev->write_exit_completion, 2*HZ);
 	}
 
 	tmp_frame = (void*) atomic64_read(&dev->write_buffer);
@@ -420,10 +420,6 @@ static int dmx_usb_release (struct inode *inode, struct file *file)
 		goto exit_not_opened;
 	}
 
-	/* wait for any bulk writes that might be going on to finish up */
-	if (atomic_read (&dev->write_busy))
-		wait_for_completion (&dev->write_finished);
-
 	--dev->open;
 
 	if (!dev->present && !dev->open) {
@@ -480,6 +476,7 @@ static int dmx_write_thread(void *data)
 	ssize_t bytes_written;
 	ktime_t aux_time;
 	__u32 frame_transfer_time_ns;
+	int64_t frame_sleep_time_ns;
 
 	dev = (struct dmx_usb_device*)data;
 
@@ -526,9 +523,13 @@ static int dmx_write_thread(void *data)
 				complete(&dev->async_write_completion);
 			}
 
-			if (bytes_written > 0) {
+			if (bytes_written > 0 && bytes_written <= 513) {
 				frame_transfer_time_ns = (92 + 12 + (44 * bytes_written)) * 1000;
-				dmx_sleep((frame_transfer_time_ns - aux_time) + 1000000);
+				frame_sleep_time_ns = (frame_transfer_time_ns - aux_time) + 1000000;
+
+				if (frame_sleep_time_ns > 0 && frame_sleep_time_ns < DMX_NS_PER_FRAME_MAX) {
+					dmx_sleep(frame_sleep_time_ns);
+				}
 			}
 
 			dmx_usb_wait_temt(dev);
@@ -611,11 +612,14 @@ static ssize_t dmx_usb_write_internal(struct dmx_usb_device *dev, const char *bu
 	}
 
 	aux_time = ktime_get() - aux_time;
-	(*urb_time) = aux_time;
+
+	if (aux_time > 0) {
+		(*urb_time) = aux_time;
+	} else {
+		(*urb_time) = 0;
+	}
 	
 	//dbg("[DMX USB] URB callback time %lu ms", aux_time / 1000000);
-
-	
 
 exit:
 	return retval;
@@ -708,7 +712,7 @@ static ssize_t dmx_usb_write (struct file *file, const char *buffer, size_t coun
 			atomic_set(&dev->write_buffer_size, retval);
 			atomic64_set(&dev->write_buffer, (__u64) from_user);
 
-			wait_for_completion_interruptible_timeout(&dev->async_write_completion, 1*HZ);
+			wait_for_completion_interruptible_timeout(&dev->async_write_completion, 2*HZ);
 		} else {
 			kfree(from_user);
 			// err("[DMX USB] Frame dropped.");
@@ -947,10 +951,10 @@ static void dmx_usb_disconnect(struct usb_interface *interface)
 	/* terminate an ongoing write */
 	if (atomic_read (&dev->write_busy)) {
 		usb_unlink_urb (dev->write_urb);
-		wait_for_completion (&dev->write_finished);
 	}
 
-	wait_for_completion(&dev->write_exit_completion);
+	wait_for_completion_interruptible_timeout(&dev->write_exit_completion, 2*HZ);
+	dev->ktask = NULL;
 
 	down(&dev->write_sem);
 	down(&dev->sem);
