@@ -112,7 +112,7 @@ static ktime_t test_cb_time;
 static __u8 all_write_thread_run;
 
 /* prevent races between open() and disconnect() */
-	static DEFINE_SEMAPHORE(disconnect_sem);
+	static DEFINE_SEMAPHORE(disconnect_sem, 1);
 
 // 30 FPS (writes seems to take a max of 32ms)
 #define DMX_NS_PER_FRAME_NORMAL (33 * 1000 * 1000)
